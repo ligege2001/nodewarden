@@ -75,6 +75,7 @@ export default function SecurityDevicesPage(props: SecurityDevicesPageProps) {
             <tr>
               <th>{t('txt_device')}</th>
               <th>{t('txt_type')}</th>
+              <th>{t('txt_status')}</th>
               <th>{t('txt_added')}</th>
               <th>{t('txt_last_seen')}</th>
               <th>{t('txt_trusted_until')}</th>
@@ -89,6 +90,11 @@ export default function SecurityDevicesPage(props: SecurityDevicesPageProps) {
                   <div className="muted-inline">{device.identifier}</div>
                 </td>
                 <td data-label={t('txt_type')}>{mapDeviceTypeName(device.type)}</td>
+                <td data-label={t('txt_status')}>
+                  <span className={`device-status-pill ${device.online ? 'online' : 'offline'}`}>
+                    {device.online ? t('txt_online') : t('txt_offline')}
+                  </span>
+                </td>
                 <td data-label={t('txt_added')}>{formatDateTime(device.creationDate)}</td>
                 <td data-label={t('txt_last_seen')}>{formatDateTime(device.revisionDate)}</td>
                 <td data-label={t('txt_trusted_until')}>
@@ -122,7 +128,7 @@ export default function SecurityDevicesPage(props: SecurityDevicesPageProps) {
             ))}
             {!props.loading && props.devices.length === 0 && (
               <tr>
-                <td colSpan={6}>
+                <td colSpan={7}>
                   <div className="empty" style={{ minHeight: 80 }}>{t('txt_no_devices_found')}</div>
                 </td>
               </tr>

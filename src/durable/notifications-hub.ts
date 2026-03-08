@@ -3,6 +3,8 @@ import type { Env } from '../types';
 const SIGNALR_RECORD_SEPARATOR = 0x1e;
 const SIGNALR_HANDSHAKE_ACK = new Uint8Array([0x7b, 0x7d, SIGNALR_RECORD_SEPARATOR]);
 const SIGNALR_UPDATE_TYPE_SYNC_VAULT = 5;
+const SIGNALR_UPDATE_TYPE_LOG_OUT = 11;
+const SIGNALR_UPDATE_TYPE_DEVICE_STATUS = 12;
 const SIGNALR_PING_INTERVAL_MS = 15_000;
 
 type HubProtocol = 'json' | 'messagepack';
@@ -10,6 +12,7 @@ type HubProtocol = 'json' | 'messagepack';
 interface ConnectionState {
   handshakeComplete: boolean;
   protocol: HubProtocol;
+  deviceIdentifier: string | null;
 }
 
 function concatBytes(chunks: Uint8Array[]): Uint8Array {
@@ -123,14 +126,19 @@ function frameSignalRBinary(payload: Uint8Array): Uint8Array {
   return concatBytes([new Uint8Array(prefix), payload]);
 }
 
-function buildSignalRJsonInvocation(userId: string, revisionDate: string, contextId: string | null): string {
+function buildSignalRJsonInvocation(
+  userId: string,
+  updateType: number,
+  revisionDate: string,
+  contextId: string | null
+): string {
   return JSON.stringify({
     type: 1,
     target: 'ReceiveMessage',
     arguments: [
       {
         ContextId: contextId,
-        Type: SIGNALR_UPDATE_TYPE_SYNC_VAULT,
+        Type: updateType,
         Payload: {
           UserId: userId,
           Date: revisionDate,
@@ -144,7 +152,12 @@ function buildSignalRJsonPing(): string {
   return JSON.stringify({ type: 6 }) + String.fromCharCode(SIGNALR_RECORD_SEPARATOR);
 }
 
-function buildSignalRMessagePackInvocation(userId: string, revisionDate: string, contextId: string | null): Uint8Array {
+function buildSignalRMessagePackInvocation(
+  userId: string,
+  updateType: number,
+  revisionDate: string,
+  contextId: string | null
+): Uint8Array {
   // SignalR MessagePack hub protocol uses an array-based invocation shape:
   // [type, headers, invocationId, target, arguments]
   const payload = encodeMsgPack([
@@ -155,7 +168,7 @@ function buildSignalRMessagePackInvocation(userId: string, revisionDate: string,
     [
       {
         ContextId: contextId,
-        Type: SIGNALR_UPDATE_TYPE_SYNC_VAULT,
+        Type: updateType,
         Payload: {
           UserId: userId,
           Date: new Date(revisionDate),
@@ -189,23 +202,30 @@ export class NotificationsHub {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === '/internal/bind-user' && request.method === 'POST') {
-      const body = (await request.json().catch(() => null)) as { userId?: string } | null;
-      this.userId = String(request.headers.get('X-NodeWarden-UserId') || body?.userId || this.userId).trim();
-      return new Response(null, { status: 204 });
-    }
-
     if (url.pathname === '/internal/notify' && request.method === 'POST') {
       const body = (await request.json().catch(() => null)) as {
         revisionDate?: string;
         userId?: string;
         contextId?: string | null;
+        updateType?: number;
+        targetDeviceIdentifier?: string | null;
       } | null;
       const revisionDate = String(body?.revisionDate || '').trim() || new Date().toISOString();
       this.userId = String(request.headers.get('X-NodeWarden-UserId') || body?.userId || this.userId).trim();
       const contextId = String(body?.contextId || '').trim() || null;
-      this.broadcastVaultSync(revisionDate, contextId);
+      const updateType = Number(body?.updateType || SIGNALR_UPDATE_TYPE_SYNC_VAULT) || SIGNALR_UPDATE_TYPE_SYNC_VAULT;
+      const targetDeviceIdentifier = String(body?.targetDeviceIdentifier || '').trim() || null;
+      this.broadcastMessage(updateType, revisionDate, contextId, targetDeviceIdentifier);
       return new Response(null, { status: 204 });
+    }
+
+    if (url.pathname === '/internal/online' && request.method === 'GET') {
+      return new Response(JSON.stringify({ deviceIdentifiers: this.getOnlineDeviceIdentifiers() }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
     }
 
     if (url.pathname !== '/notifications/hub') {
@@ -214,6 +234,12 @@ export class NotificationsHub {
 
     if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected websocket', { status: 426 });
+    }
+
+    const requestUserId = String(url.searchParams.get('nw_uid') || '').trim();
+    const requestDeviceIdentifier = String(url.searchParams.get('nw_did') || '').trim() || null;
+    if (requestUserId) {
+      this.userId = requestUserId;
     }
 
     if (!this.userId) {
@@ -228,6 +254,7 @@ export class NotificationsHub {
     this.connections.set(server, {
       handshakeComplete: false,
       protocol: 'messagepack',
+      deviceIdentifier: requestDeviceIdentifier,
     });
     this.ensurePingLoop();
 
@@ -235,12 +262,16 @@ export class NotificationsHub {
       void this.handleSocketMessage(server, event.data);
     });
     server.addEventListener('close', () => {
+      const shouldBroadcast = !!this.connections.get(server)?.handshakeComplete;
       this.connections.delete(server);
       this.stopPingLoopIfIdle();
+      if (shouldBroadcast) this.broadcastDeviceStatus();
     });
     server.addEventListener('error', () => {
+      const shouldBroadcast = !!this.connections.get(server)?.handshakeComplete;
       this.connections.delete(server);
       this.stopPingLoopIfIdle();
+      if (shouldBroadcast) this.broadcastDeviceStatus();
       try {
         server.close(1011, 'Socket error');
       } catch {
@@ -268,6 +299,7 @@ export class NotificationsHub {
           connection.protocol = protocol;
           connection.handshakeComplete = true;
           socket.send(SIGNALR_HANDSHAKE_ACK);
+          this.broadcastDeviceStatus();
           return;
         } catch {
           // Ignore malformed pre-handshake payloads.
@@ -317,16 +349,31 @@ export class NotificationsHub {
     this.stopPingLoopIfIdle();
   }
 
-  private broadcastVaultSync(revisionDate: string, contextId: string | null): void {
+  private getOnlineDeviceIdentifiers(): string[] {
+    const out = new Set<string>();
+    for (const connection of this.connections.values()) {
+      if (!connection.handshakeComplete || !connection.deviceIdentifier) continue;
+      out.add(connection.deviceIdentifier);
+    }
+    return Array.from(out);
+  }
+
+  private broadcastMessage(
+    updateType: number,
+    revisionDate: string,
+    contextId: string | null,
+    targetDeviceIdentifier: string | null
+  ): void {
     if (!this.userId || this.connections.size === 0) return;
 
     for (const [socket, connection] of this.connections) {
       if (!connection.handshakeComplete) continue;
+      if (targetDeviceIdentifier && connection.deviceIdentifier !== targetDeviceIdentifier) continue;
       try {
         if (connection.protocol === 'json') {
-          socket.send(buildSignalRJsonInvocation(this.userId, revisionDate, contextId));
+          socket.send(buildSignalRJsonInvocation(this.userId, updateType, revisionDate, contextId));
         } else {
-          socket.send(buildSignalRMessagePackInvocation(this.userId, revisionDate, contextId));
+          socket.send(buildSignalRMessagePackInvocation(this.userId, updateType, revisionDate, contextId));
         }
       } catch {
         this.connections.delete(socket);
@@ -340,6 +387,10 @@ export class NotificationsHub {
 
     this.stopPingLoopIfIdle();
   }
+
+  private broadcastDeviceStatus(): void {
+    this.broadcastMessage(SIGNALR_UPDATE_TYPE_DEVICE_STATUS, new Date().toISOString(), null, null);
+  }
 }
 
 export async function notifyUserVaultSync(
@@ -347,6 +398,38 @@ export async function notifyUserVaultSync(
   userId: string,
   revisionDate: string,
   contextId?: string | null
+): Promise<void> {
+  return notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_SYNC_VAULT, revisionDate, contextId ?? null, null);
+}
+
+export async function notifyUserLogout(
+  env: Env,
+  userId: string,
+  targetDeviceIdentifier?: string | null
+): Promise<void> {
+  return notifyUserUpdate(env, userId, SIGNALR_UPDATE_TYPE_LOG_OUT, new Date().toISOString(), null, targetDeviceIdentifier ?? null);
+}
+
+export async function getOnlineUserDevices(env: Env, userId: string): Promise<string[]> {
+  try {
+    const id = env.NOTIFICATIONS_HUB.idFromName(userId);
+    const stub = env.NOTIFICATIONS_HUB.get(id);
+    const response = await stub.fetch('https://notifications/internal/online');
+    if (!response.ok) return [];
+    const body = (await response.json().catch(() => null)) as { deviceIdentifiers?: string[] } | null;
+    return Array.isArray(body?.deviceIdentifiers) ? body.deviceIdentifiers.filter((value) => !!String(value || '').trim()) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function notifyUserUpdate(
+  env: Env,
+  userId: string,
+  updateType: number,
+  revisionDate: string,
+  contextId: string | null,
+  targetDeviceIdentifier: string | null
 ): Promise<void> {
   try {
     const id = env.NOTIFICATIONS_HUB.idFromName(userId);
@@ -357,9 +440,14 @@ export async function notifyUserVaultSync(
         'Content-Type': 'application/json',
         'X-NodeWarden-UserId': userId,
       },
-      body: JSON.stringify({ revisionDate, contextId: contextId || null }),
+      body: JSON.stringify({
+        revisionDate,
+        contextId: contextId || null,
+        updateType,
+        targetDeviceIdentifier: targetDeviceIdentifier || null,
+      }),
     });
   } catch (error) {
-    console.error('Failed to broadcast vault sync notification:', error);
+    console.error('Failed to broadcast realtime notification:', error);
   }
 }

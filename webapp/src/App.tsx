@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { Link, Route, Switch, useLocation } from 'wouter';
 import { useQuery } from '@tanstack/react-query';
-import { ArrowUpDown, Cloud, Clock3, Folder, KeyRound, Lock, LogOut, Send as SendIcon, Settings as SettingsIcon, Shield, ShieldUser } from 'lucide-preact';
+import { ArrowUpDown, Cloud, Clock3, Folder as FolderIcon, KeyRound, Lock, LogOut, Send as SendIcon, Settings as SettingsIcon, Shield, ShieldUser } from 'lucide-preact';
 import AuthViews from '@/components/AuthViews';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import ToastHost from '@/components/ToastHost';
@@ -87,7 +87,7 @@ import {
 } from '@/lib/export-formats';
 import { t } from '@/lib/i18n';
 import type { CiphersImportPayload } from '@/lib/api';
-import type { AppPhase, AuthorizedDevice, Cipher, Folder, Profile, Send, SendDraft, SessionState, ToastMessage, VaultDraft } from '@/lib/types';
+import type { AppPhase, AuthorizedDevice, Cipher, Folder as VaultFolder, Profile, Send, SendDraft, SessionState, ToastMessage, VaultDraft } from '@/lib/types';
 
 interface PendingTotp {
   email: string;
@@ -296,6 +296,9 @@ function buildPublicSendUrl(origin: string, accessId: string, keyPart: string): 
 }
 
 const SIGNALR_RECORD_SEPARATOR = String.fromCharCode(0x1e);
+const SIGNALR_UPDATE_TYPE_SYNC_VAULT = 5;
+const SIGNALR_UPDATE_TYPE_LOG_OUT = 11;
+const SIGNALR_UPDATE_TYPE_DEVICE_STATUS = 12;
 
 interface WebVaultSignalRInvocation {
   type?: number;
@@ -371,11 +374,12 @@ export default function App() {
 
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const [mobileLayout, setMobileLayout] = useState(false);
-  const [decryptedFolders, setDecryptedFolders] = useState<Folder[]>([]);
+  const [decryptedFolders, setDecryptedFolders] = useState<VaultFolder[]>([]);
   const [decryptedCiphers, setDecryptedCiphers] = useState<Cipher[]>([]);
   const [decryptedSends, setDecryptedSends] = useState<Send[]>([]);
   const migratedPlainFolderIdsRef = useRef<Set<string>>(new Set());
   const silentRefreshVaultRef = useRef<() => Promise<void>>(async () => {});
+  const refreshAuthorizedDevicesRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
     const syncInviteFromUrl = () => {
@@ -1031,6 +1035,7 @@ export default function App() {
 
       socket.addEventListener('open', () => {
         reconnectAttempts = 0;
+        void refreshAuthorizedDevicesRef.current();
         try {
           socket?.send(`{"protocol":"json","version":1}${SIGNALR_RECORD_SEPARATOR}`);
         } catch {
@@ -1045,6 +1050,16 @@ export default function App() {
         const frames = parseSignalRTextFrames(event.data);
         for (const frame of frames) {
           if (frame.type !== 1 || frame.target !== 'ReceiveMessage') continue;
+          const updateType = Number(frame.arguments?.[0]?.Type || 0);
+          if (updateType === SIGNALR_UPDATE_TYPE_LOG_OUT) {
+            logoutNow();
+            return;
+          }
+          if (updateType === SIGNALR_UPDATE_TYPE_DEVICE_STATUS) {
+            void refreshAuthorizedDevicesRef.current();
+            continue;
+          }
+          if (updateType !== SIGNALR_UPDATE_TYPE_SYNC_VAULT) continue;
           const contextId = String(frame.arguments?.[0]?.ContextId || '').trim();
           if (contextId && contextId === getCurrentDeviceIdentifier()) continue;
           void silentRefreshVaultRef.current();
@@ -1053,6 +1068,7 @@ export default function App() {
 
       socket.addEventListener('close', () => {
         socket = null;
+        void refreshAuthorizedDevicesRef.current();
         scheduleReconnect();
       });
 
@@ -1083,6 +1099,8 @@ export default function App() {
   async function refreshAuthorizedDevices() {
     await authorizedDevicesQuery.refetch();
   }
+
+  refreshAuthorizedDevicesRef.current = refreshAuthorizedDevices;
 
   async function revokeDeviceTrustAction(device: AuthorizedDevice) {
     await revokeAuthorizedDeviceTrust(authedFetch, device.identifier);
@@ -1751,7 +1769,8 @@ export default function App() {
   }
 
   function downloadBytesAsFile(bytes: Uint8Array, fileName: string, mimeType: string) {
-    const blob = new Blob([bytes], { type: mimeType || 'application/octet-stream' });
+    const payload = bytes.slice();
+    const blob = new Blob([payload], { type: mimeType || 'application/octet-stream' });
     const objectUrl = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
     anchor.href = objectUrl;
@@ -1967,7 +1986,7 @@ export default function App() {
                   title={sidebarToggleTitle}
                   onClick={() => window.dispatchEvent(new CustomEvent('nodewarden:toggle-sidebar'))}
                 >
-                  <Folder size={16} className="btn-icon" />
+                  <FolderIcon size={16} className="btn-icon" />
                 </button>
               )}
               <button type="button" className="btn btn-secondary small mobile-lock-btn" aria-label={t('txt_lock')} title={t('txt_lock')} onClick={handleLock}>

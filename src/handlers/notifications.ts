@@ -1,5 +1,5 @@
 import { AuthService } from '../services/auth';
-import type { Env } from '../types';
+import type { Env, JWTPayload } from '../types';
 import { errorResponse, jsonResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 
@@ -13,18 +13,17 @@ function extractAccessToken(request: Request): string | null {
   return match?.[1]?.trim() || null;
 }
 
-async function authenticateNotificationsRequest(request: Request, env: Env): Promise<string | null> {
+async function authenticateNotificationsRequest(request: Request, env: Env): Promise<JWTPayload | null> {
   const accessToken = extractAccessToken(request);
   if (!accessToken) return null;
 
   const auth = new AuthService(env);
-  const payload = await auth.verifyAccessToken(`Bearer ${accessToken}`);
-  return payload?.sub || null;
+  return auth.verifyAccessToken(`Bearer ${accessToken}`);
 }
 
 export async function handleNotificationsNegotiate(request: Request, env: Env): Promise<Response> {
-  const userId = await authenticateNotificationsRequest(request, env);
-  if (!userId) return errorResponse('Unauthorized', 401);
+  const payload = await authenticateNotificationsRequest(request, env);
+  if (!payload?.sub) return errorResponse('Unauthorized', 401);
 
   const connectionId = generateUUID();
   return jsonResponse({
@@ -41,21 +40,19 @@ export async function handleNotificationsNegotiate(request: Request, env: Env): 
 }
 
 export async function handleNotificationsHub(request: Request, env: Env): Promise<Response> {
-  const userId = await authenticateNotificationsRequest(request, env);
-  if (!userId) return errorResponse('Unauthorized', 401);
+  const payload = await authenticateNotificationsRequest(request, env);
+  if (!payload?.sub) return errorResponse('Unauthorized', 401);
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
     return errorResponse('Expected websocket', 426);
   }
 
+  const userId = payload.sub;
   const id = env.NOTIFICATIONS_HUB.idFromName(userId);
   const stub = env.NOTIFICATIONS_HUB.get(id);
-  await stub.fetch('https://notifications/internal/bind-user', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-NodeWarden-UserId': userId,
-    },
-    body: JSON.stringify({ userId }),
-  });
-  return stub.fetch(request);
+  const forwardedUrl = new URL(request.url);
+  forwardedUrl.searchParams.set('nw_uid', userId);
+  if (payload.did) {
+    forwardedUrl.searchParams.set('nw_did', payload.did);
+  }
+  return stub.fetch(new Request(forwardedUrl.toString(), request));
 }
